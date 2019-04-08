@@ -14,7 +14,7 @@ export PYTHONUNBUFFERED=1
 if grep -q '^Fedora' /etc/redhat-release; then
     export ISFEDORA=1
     export ISEL=''
-elif grep -q '^Red Hat' /etc/redhat-release; then
+elif grep -qE '^Red Hat|^CentOS' /etc/redhat-release; then
     export ISFEDORA=''
     export ISEL=1
 else
@@ -238,6 +238,7 @@ else
         "x86_64")  QEMU_KVM="qemu-system-$(arch) -accel kvm"         ;;
         "aarch64") QEMU_KVM="qemu-system-$(arch) -accel kvm -M virt" ;;
         "ppc64le") QEMU_KVM="qemu-system-ppc64 -accel kvm"           ;;
+        "s390x")   QEMU_KVM="qemu-system-s390x -accel kvm"           ;;
         *)         fatal "Architecture $(arch) not supported"
     esac
 fi

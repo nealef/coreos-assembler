@@ -5,7 +5,7 @@ set -euo pipefail
 if grep -q '^Fedora' /etc/redhat-release; then
     ISFEDORA=1
     ISEL=''
-elif grep -q '^Red Hat' /etc/redhat-release; then
+elif grep -qE '^Red Hat|CentOS' /etc/redhat-release; then
     ISFEDORA=''
     ISEL=1
 else
@@ -72,10 +72,12 @@ install_rpms() {
         rpm -q grubby && yum remove -y grubby
     fi
 
-    # Open up permissions on /boot/efi files so we can copy them
-    # for our ISO installer image
-    find /boot/efi -type f -print0 | xargs -r -0 chmod +r
-    find /boot/efi -type d -print0 | xargs -r -0 chmod +rx
+    if [ ${arch} != "s390x" ]; then
+        # Open up permissions on /boot/efi files so we can copy them
+        # for our ISO installer image
+        find /boot/efi -type f -print0 | xargs -r -0 chmod +r
+        find /boot/efi -type d -print0 | xargs -r -0 chmod +rx
+    fi
 
     # Further cleanup
     yum clean all
@@ -90,6 +92,7 @@ _prep_make_and_make_install() {
     # /usr/bin/ostree-releng-script-rsync-repos
     mkdir -p /usr/app/
     rsync -rlv "${srcdir}"/ostree-releng-scripts/ /usr/app/ostree-releng-scripts/
+    git submodule update --init
 
     if [ "$(git submodule status mantle | head -c1)" == "-" ]; then
         echo -e "\033[1merror: submodules not initialized. Run: git submodule update --init\033[0m" 1>&2
@@ -119,17 +122,19 @@ repository_dirs[s390x]=fedora-secondary
 repository_dir=${repository_dirs[$arch]}
 INSTALLER=https://download.fedoraproject.org/pub/$repository_dir/releases/$release/Everything/$arch/iso/Fedora-Everything-netinst-$arch-$release-1.2.iso
 INSTALLER_CHECKSUM=https://download.fedoraproject.org/pub/$repository_dir/releases/$release/Everything/$arch/iso/Fedora-Everything-$release-1.2-$arch-CHECKSUM
+INSTALLER=http://download.sinenomine.net/clefos/7/iso/76os.iso
+INSTALLER_CHECKSUM=http://download.sinenomine.net/clefos/7/iso/76os.sha256
 
 install_anaconda() {
     # Overriding install URL
     if [ -n "${INSTALLER_URL_OVERRIDE-}" ]; then
         INSTALLER="${INSTALLER_URL_OVERRIDE}"
-        info "Overriding the install URL with contents of INSTALLER_URL_OVERRIDE"
+        echo "Overriding the install URL with contents of INSTALLER_URL_OVERRIDE"
     fi
     # Overriding install checksum URL
     if [ -n "${INSTALLER_CHECKSUM_URL_OVERRIDE-}" ]; then
         INSTALLER_CHECKSUM="${INSTALLER_CHECKSUM_URL_OVERRIDE}"
-        info "Overriding the install checksum URL with contents of INSTALLER_CHECKSUM_URL_OVERRIDE"
+        echo "Overriding the install checksum URL with contents of INSTALLER_CHECKSUM_URL_OVERRIDE"
     fi
 
     installer_bn=$(basename "${INSTALLER}")
