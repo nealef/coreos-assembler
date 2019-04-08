@@ -3,12 +3,13 @@
 #
 # An operation that creates an ISO image for installing CoreOS
 
-import os
-import sys
-import json
-import yaml
-import shutil
 import argparse
+import json
+import os
+import platform
+import shutil
+import sys
+import tarfile
 import tempfile
 
 sys.path.insert(0, '/usr/lib/coreos-assembler')
@@ -29,7 +30,8 @@ if not args.build:
 
 print(f"Targeting build: {args.build}")
 
-builddir = os.path.join('builds', args.build)
+workdir = os.path.abspath(os.getcwd())
+builddir = os.path.join(workdir, 'builds', args.build)
 buildmeta_path = os.path.join(builddir, 'meta.json')
 with open(buildmeta_path) as f:
     buildmeta = json.load(f)
@@ -41,11 +43,10 @@ if 'iso' in buildmeta['images'] and not args.force:
     sys.exit(0)
 
 base_name = buildmeta['name']
-img_prefix = f'{base_name}-{args.build}'
-iso_name = f'{img_prefix}.iso'
+iso_name = f'{base_name}-{args.build}-installer.iso'
 name_version = f'{base_name}-{args.build}'
 
-tmpdir = 'tmp/buildpost-installer'
+tmpdir = os.environ.get("FORCE_TMPDIR", f"{workdir}/tmp/buildpost-installer")
 if os.path.isdir(tmpdir):
     shutil.rmtree(tmpdir)
 
@@ -59,6 +60,12 @@ os.mkdir(tmpisoimages)
 os.mkdir(tmpisoisolinux)
 
 def generate_iso():
+    arch = platform.machine()
+
+    if arch in ("s390", "s390x"):
+        print(f"{arch} ISO generation is not supported at the moment")
+        sys.exit(1)
+
     tmpisofile = os.path.join(tmpdir, iso_name)
 
     # Grab the commit hash for this build
@@ -82,66 +89,111 @@ def generate_iso():
 
     # TODO ignore EFI dir
     # Grab all the contents from the installer dir from the configs
-    run_verbose(["rsync", "-a", "src/config/installer/", f"{tmpisoroot}/"])
+    run_verbose(["rsync", "-av", "src/config/installer/", f"{tmpisoroot}/"])
 
-    ### For x86_64 legacy boot (BIOS) booting 
-
-    # Install binaries from syslinux package
-    isolinuxfiles = [('/usr/share/syslinux/isolinux.bin', 0o755),
-                     ('/usr/share/syslinux/ldlinux.c32',  0o755),
-                     ('/usr/share/syslinux/libcom32.c32', 0o755),
-                     ('/usr/share/syslinux/libutil.c32',  0o755),
-                     ('/usr/share/syslinux/vesamenu.c32', 0o755)]
-    for src, mode in isolinuxfiles:
-        dst = os.path.join(tmpisoisolinux, os.path.basename(src))
-        shutil.copyfile(src, dst)
-        os.chmod(dst, mode)
-
-    ### For x86_64 UEFI booting
-
-    # Create the efiboot.img file. This is a fat32 formatted
-    # filesystem that contains all the files needed for EFI boot
-    # from an ISO.
-    with tempfile.TemporaryDirectory() as tmpefidir:
-        # Install binaries from the grub2-efi and shim rpms (installed
-        # in our COSA container
-        run_verbose(["rsync", "-a",
-                     "/boot/efi/EFI/", f"{tmpefidir}/EFI/"])
-
-        # Grab all the contents from the installer EFI dir from the configs
-        run_verbose(["rsync", "-a",
-                     "src/config/installer/EFI/", f"{tmpefidir}/EFI/"])
-
-        # Create the efiboot.img file (a fat filesystem) in the images/ dir
-        # Note: virt-make-fs lets us do this as non-root
-        efibootfile = os.path.join(tmpisoimages, 'efiboot.img')
-        run_verbose(['virt-make-fs', '--type=vfat',
-                     tmpefidir, efibootfile])
+    # These sections are based on lorax templates
+    # see https://github.com/weldr/lorax/tree/master/share/templates.d/99-generic
 
     # Generate the ISO image. Lots of good info here:
     # https://fedoraproject.org/wiki/User:Pjones/BootableCDsForBIOSAndUEFI
-    run_verbose(['/usr/bin/genisoimage', '-verbose',
-                 '-volset', f"{name_version}",
-                 # For  greater portability, consider using both
-                 # Joliet and Rock Ridge extensions. Umm, OK :)
-                 '-rock', '-J', '-joliet-long',
-                 # for legacy bios boot AKA eltorito boot
-                 '-eltorito-boot', 'isolinux/isolinux.bin',
-                 '-eltorito-catalog', 'isolinux/boot.cat',
-                 '-no-emul-boot',
-                 '-boot-load-size', '4',
-                 '-boot-info-table',
-                 # for EFI boot
-                 '-eltorito-alt-boot',
-                 '-efi-boot', 'images/efiboot.img',
-                 '-no-emul-boot',
-                 # Define inputs and outputs
-                 '-o', tmpisofile, tmpisoroot])
+    genisoargs = ['/usr/bin/genisoimage', '-verbose',
+                  '-volset', f"{name_version}",
+                  # For  greater portability, consider using both
+                  # Joliet and Rock Ridge extensions. Umm, OK :)
+                  '-rock', '-J', '-joliet-long']
+
+    ### For x86_64 legacy boot (BIOS) booting
+    if arch == "x86_64":
+        # Install binaries from syslinux package
+        isolinuxfiles = [('/usr/share/syslinux/isolinux.bin', 0o755),
+                         ('/usr/share/syslinux/ldlinux.c32',  0o755),
+                         ('/usr/share/syslinux/libcom32.c32', 0o755),
+                         ('/usr/share/syslinux/libutil.c32',  0o755),
+                         ('/usr/share/syslinux/vesamenu.c32', 0o755)]
+        for src, mode in isolinuxfiles:
+            dst = os.path.join(tmpisoisolinux, os.path.basename(src))
+            shutil.copyfile(src, dst)
+            os.chmod(dst, mode)
+
+        # for legacy bios boot AKA eltorito boot
+        genisoargs += ['-eltorito-boot', 'isolinux/isolinux.bin',
+                       '-eltorito-catalog', 'isolinux/boot.cat',
+                       '-no-emul-boot',
+                       '-boot-load-size', '4',
+                       '-boot-info-table']
+
+    elif arch == "ppc64le":
+        genisoargs += ['-r', '-l', '-sysid', 'PPC',
+                       '-chrp-boot', '-graft-points']
+
+    ### For x86_64 and aarch64 UEFI booting
+    if arch in ("x86_64", "aarch64"):
+        # Create the efiboot.img file. This is a fat32 formatted
+        # filesystem that contains all the files needed for EFI boot
+        # from an ISO.
+        with tempfile.TemporaryDirectory() as tmpefidir:
+
+            # In restrictive environments, setgid, setuid and ownership changes
+            # may be restricted. This sets the file ownership to root and
+            # removes the setgid and setuid bits in the tarball.
+            def strip(tarinfo):
+                tarinfo.uid = 0
+                tarinfo.gid = 0
+                if tarinfo.isdir():
+                    tarinfo.mode = 0o755
+                elif tarinfo.isfile():
+                    tarinfo.mode = 0o0644
+                return tarinfo
+
+            # Install binaries from the grub2-efi and shim rpms (installed
+            # in our COSA container). Manually construct the tarball to ensure
+            # proper permissions and ownership
+            efitarfile = tempfile.NamedTemporaryFile(suffix=".tar")
+            with tarfile.open(efitarfile.name, "w:") as tar:
+                tar.add('/boot/efi/EFI/', arcname="/EFI", filter=strip)
+                tar.add('src/config/installer/EFI/', arcname='/EFI',
+                        filter=strip)
+
+            # Create the efiboot.img file (a fat filesystem) in the images/ dir
+            # Note: virt-make-fs lets us do this as non-root
+            efibootfile = os.path.join(tmpisoimages, 'efiboot.img')
+            run_verbose(['virt-make-fs', '--type=vfat', efitarfile.name,
+                         efibootfile])
+
+        genisoargs += ['-eltorito-alt-boot',
+                       '-efi-boot', 'images/efiboot.img',
+                       '-no-emul-boot']
+
+    # Define inputs and outputs
+    genisoargs += ['-o', tmpisofile, tmpisoroot]
+
+    run_verbose(genisoargs)
+
+    kernel_name = f'{base_name}-{args.build}-installer-kernel'
+    initramfs_name = f'{base_name}-{args.build}-installer-initramfs.img'
+    kernel_file = os.path.join(builddir, kernel_name)
+    initramfs_file = os.path.join(builddir, initramfs_name)
+    shutil.copyfile(os.path.join(tmpisoimages, "vmlinuz"), kernel_file)
+    shutil.copyfile(os.path.join(tmpisoimages, "initramfs.img"), initramfs_file)
+
+    kernel_checksum = sha256sum_file(kernel_file)
+    initramfs_checksum = sha256sum_file(initramfs_file)
     checksum = sha256sum_file(tmpisofile)
-    buildmeta['images']['iso'] = {
-        'path': iso_name,
-        'sha256': checksum
-    }
+
+    buildmeta['images'].update({
+        'iso': {
+            'path': iso_name,
+            'sha256': checksum
+        },
+        'kernel': {
+            'path': kernel_name,
+            'sha256': kernel_checksum
+        },
+        'initramfs': {
+            'path': initramfs_name,
+            'sha256': initramfs_checksum
+        }
+    })
     os.rename(tmpisofile, f"{builddir}/{iso_name}")
     write_json(buildmeta_path, buildmeta)
     print(f"Updated: {buildmeta_path}")

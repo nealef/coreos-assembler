@@ -9,23 +9,29 @@
 # one or both.
 
 import os,sys,argparse,subprocess,io,time,re,multiprocessing
-import tempfile,shutil,yaml,platform
+import tempfile,shutil,yaml,platform,json
+
+# Soon we should create the filesystem outside of anaconda
+ANACONDA_BOOT_SIZE_MB = 1024
 
 def fatal(msg):
     print('error: {}'.format(msg), file=sys.stderr)
     raise SystemExit(1)
 
+# Set of valid keys in image.yaml
+IMAGE_CONF_KEYS = ['size', 'postprocess-script']
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--dest", help="Destination disk",
                     action='store', required=True)
+parser.add_argument("--tmpdir", help="Temporary directory",
+                    action='store', required=True)
 parser.add_argument("--create-disk", help="Automatically create disk as qcow2, parsing kickstart for size",
                     action='store_true')
-parser.add_argument("--image-config", help="coreos-assembler image.yaml",
-                    action='store')
+parser.add_argument("--configdir", help="coreos-assembler configdir",
+                    action='store', required=True)
 parser.add_argument("--variant", help="Use an internal (kickstart) config",
                     choices=('metal', 'metal-uefi', 'cloud'), default=None)
-parser.add_argument("--kickstart", help="Kickstart path",
-                    action='store')
 parser.add_argument("--kickstart-out", help="Save flattened kickstart",
                     action='store')
 parser.add_argument("--location", help="Installer location",
@@ -93,7 +99,6 @@ else:
 disk_size = None
 
 if args.variant is not None:
-    assert args.kickstart is None
     if args.variant == 'metal-uefi':
         variant_ks = 'metal'
     else:
@@ -101,17 +106,25 @@ if args.variant is not None:
     with open(f'/usr/lib/coreos-assembler/image-{variant_ks}.ks') as f:
         shutil.copyfileobj(f, ks_tmp)
 
-if args.image_config:
-    with open('/usr/lib/coreos-assembler/image-base.ks') as basef:
-        shutil.copyfileobj(basef, ks_tmp)
-    image_conf = None
-    with open(args.image_config) as f:
-        image_conf = yaml.safe_load(f)
-    disk_size = int(image_conf['size'])
-elif args.kickstart:
-    run_sync_verbose(['ksflatten', '-c', args.kickstart], stdout=ks_tmp)
-else:
-    raise SystemExit("Either --kickstart or --image-conf must be specified")
+with open('/usr/lib/coreos-assembler/image-base.ks') as basef:
+    shutil.copyfileobj(basef, ks_tmp)
+image_conf = None
+with open(args.configdir + '/image.yaml') as f:
+    image_conf = yaml.safe_load(f)
+for k in image_conf:
+    if not k in IMAGE_CONF_KEYS:
+        fatal(f"Unknown key '{k}' in image.yaml")
+disk_size = int(image_conf['size'])
+
+# To support different distro builds using Fedora anaconda,
+# installclass must be explicit for anaconda to find the correct directory.
+if subprocess.call(['ostree', f"--repo={args.ostree_repo}", 'ls', args.ostree_ref, "/usr/lib/ostree-boot/efi/EFI/redhat"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+    print("Detected /usr/lib/ostree-boot/efi/EFI/redhat, adding Red Hat Enterprise Linux installclass.")
+    ks_tmp.write("""
+    %anaconda
+    installclass --name="Red Hat Enterprise Linux"
+    %end
+    """)
 
 # This is an implementation detail of https://github.com/coreos/ignition-dracut
 # So we hardcode it here.
@@ -163,27 +176,25 @@ ostree refs --delete {args.ostree_remote}:{args.ostree_ref}
 %end
 """)
 
-# This is an "extension" to kickstart files that we implement as a comment.
-if args.create_disk and args.kickstart:
-    magic_virt_install_size_str = '#--coreos-virt-install-disk-size-gb:'
-    disk_re = re.compile(r'^' + magic_virt_install_size_str + ' *([0-9]+)$')
-    with open(args.kickstart) as f:
-        for line in f:
-            m = disk_re.search(line)
-            if not m:
-                continue
-            disk_size = int(m.group(1))
-            break
-    if disk_size is None:
-        fatal("--create-disk specified, but failed to find '{}' in kickstart".format(magic_virt_install_size_str))
-
 if args.create_disk:
     if args.variant in ('metal', 'metal-uefi'):
         fmt = 'raw'
+        size_estimate_path = os.path.join(args.tmpdir, 'ostree-size.json')
+        # The OSTree size is shared among disk images, so we compute it once per build
+        if not os.path.exists(size_estimate_path):
+            subprocess.check_call(['/usr/lib/coreos-assembler/estimate-commit-disk-size',
+                                   f"--repo={args.ostree_repo}", args.ostree_ref],
+                                  stdout=open(size_estimate_path, 'w'))
+        with open(size_estimate_path) as f:
+            size_estimate = json.load(f)
+        print(f"OSTree commit size:\n{size_estimate}")
+        final_size_mb = size_estimate['estimate-mb']['final'] + ANACONDA_BOOT_SIZE_MB
+        size = f"{final_size_mb}M"
     else:
         fmt = 'qcow2'
-    run_sync_verbose(['qemu-img', 'create', '-f', fmt, args.dest, '{}G'.format(disk_size)])
-    print("Created initial disk: {} with size {}G".format(args.dest, disk_size))
+        size = f'{disk_size}G'
+    run_sync_verbose(['qemu-img', 'create', '-f', fmt, args.dest, size])
+    print(f"Created initial disk: {args.dest} with size {size}")
 
 # Now a hack to avoid libvirt race conditions; it's
 # activated by the cmdline (and exits after 30s), and in virt-install the daemon
@@ -263,11 +274,17 @@ try:
     # And strip out all of the Anaconda stuff in /var; this uses libguestfs
     # to ensure we fully control the code.
     cleanup_argv = ['/usr/lib/coreos-assembler/gf-anaconda-cleanup', args.dest]
-    if args.image_config is None:
-        cleanup_argv.append('--skip-partition-fixups')
     run_sync_verbose(cleanup_argv)
+
+    # This one is part of the "API" we provide to config repositories.  At least
+    # RHEL CoreOS will use it to change the OS to appear to have been provisioned
+    # from an oscontainer.
+    config_image_post = image_conf.get("postprocess-script")
+    if config_image_post is not None:
+        run_sync_verbose([os.path.join(args.configdir, config_image_post), args.dest])
+
 finally:
-    subprocess.call(['virsh', '--connect=qemu:///session', 'undefine', domain])
+    subprocess.call(['virsh', '--connect=qemu:///session', 'undefine', '--nvram', domain])
     if tail_proc is not None:
         tail_proc.terminate()
     if http_proc is not None:
